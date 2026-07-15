@@ -1,3 +1,4 @@
+# === Gradle & Eclipse 설정 ===
 .gradle
 **/build/
 !**/src/**/build/
@@ -8,7 +9,7 @@ gradle-app.setting
 # Avoid ignoring Gradle wrapper jar file (.jar files are usually ignored)
 !gradle-wrapper.jar
 
-# Avoid ignore Gradle wrappper properties
+# Avoid ignore Gradle wrapper properties
 !gradle-wrapper.properties
 
 # Cache of project
@@ -19,3 +20,19 @@ gradle-app.setting
 .project
 # JDT-specific (Eclipse Java Development Tools)
 .classpath
+
+# === AI Agent 및 에이전트 설정 파일 ===
+.agent/
+.agents/
+.codegraph/
+skills-lock.json
+
+# === OS / IDE 캐시 및 설정 파일 ===
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# === Python 컴파일 캐시 (에이전트 스크립트 실행 시 생성) ===
+**/__pycache__/
+*.pyc
