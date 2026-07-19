@@ -1,193 +1,146 @@
-# ⚾ 야구 티켓팅 접속자 대기열 시스템 (Baseball Ticketing Queue System)
+# ⚾ 야구 티켓팅 접속자 대기열 시스템
 
-본 프로젝트는 대규모 트래픽 분출이 발생하는 야구 티켓팅 환경을 가상하여, 순간적인 대용량 트래픽(평소 대비 100배 이상) 진입 시 백엔드 핵심 시스템의 장애를 방지하고 진입 속도를 안정적으로 제어할 수 있도록 설계된 **Spring WebFlux 및 Redis 기반의 리액티브 대기열 아키텍처**입니다. 
+Redis Sorted Set과 Spring WebFlux를 사용해 티켓 오픈 시점의 동시 접속자를 순차적으로 활성 상태로 전환하는 대기열 시스템입니다. 이 프로젝트는 대기열 상태의 일관성, 비정상 이탈 사용자 정리, 그리고 대기열 통과 후 보호 API 접근 제어에 초점을 뒀습니다.
 
-테스팅 및 포트폴리오용으로 구축되었으며, 스레드 차단(Blocking)을 최소화하는 비동기 이벤트 루프 모델과 Redis의 인메모리 Sorted Set을 융합하여 고성능·저비용 대기열 제어 엔진을 구현했습니다.
+## 기술 스택
 
----
+- Java 17, Gradle
+- Spring Boot 3.3, Spring WebFlux, Spring Security
+- Spring Data Reactive Redis, Redis
+- JWT (JJWT, HS256)
+- JUnit 5, Reactor Test, k6
 
-## 🛠️ Tech Stack & 핵심 기술
+## 동작 흐름
 
-*   **Language**: Java 17
-*   **Framework**: Spring Boot 3.x, Spring WebFlux (Reactive Streams)
-*   **Data Store**: Spring Data Reactive Redis (Lettuce 드라이버 기반 비동기 파이프라이닝)
-*   **Authentication**: JSON Web Token (jjwt - HS256)
-*   **Testing & Validation**: JUnit 5, Reactor Test (`StepVerifier`), Docker Redis Alpine Environment (로컬/테스트 독립 가동)
-*   **Performance Testing**: k6 Load Testing
+1. `POST /api/v1/queue/register`가 waiting ZSET과 heartbeat ZSET을 원자적으로 생성합니다.
+2. 순번 조회가 성공한 대기 사용자만 Heartbeat를 갱신합니다.
+3. Heartbeat 스케줄러는 마지막 Heartbeat가 설정된 유효 시간보다 오래된 사용자를 제한된 배치로 정리합니다.
+4. 입장 스케줄러는 설정된 배치 수만큼 waiting 사용자를 active 상태로 원자적으로 전환합니다.
+5. active 상태와 등록 시 발급된 `queueCredential`을 확인한 뒤 10분 JWT를 발급합니다.
+6. `/api/v1/follow-up/**` 보호 API는 Redis active 상태를 재조회하지 않고 JWT의 서명, 만료, issuer, audience, role을 로컬에서 검증합니다.
 
----
+## Redis 상태와 일관성
 
-## 🏗️ 시스템 아키텍처 및 데이터 흐름
+| 상태 | Redis Key | 설명 |
+| --- | --- | --- |
+| 대기열 | `queue:baseball:waiting` | 사용자 ID와 최초 등록 시각을 저장하는 ZSET |
+| Heartbeat | `queue:baseball:heartbeat` | 실제 대기 중인 사용자의 마지막 순번 조회 시각을 저장하는 ZSET |
+| 활성 상태 | `queue:baseball:active:{userId}` | 활성 사용자 여부를 나타내는 TTL String Key |
+| 대기열 자격 | `queue:baseball:credential:{userId}` | 활성 JWT 교환에 필요한 추측 불가능한 자격 값 |
 
-기존의 `Thread-per-request` 모델(Spring MVC)은 수만 명의 대기 사용자가 몰릴 경우 수많은 스레드 컨텍스트 스위칭 비용과 메모리 고갈로 서버가 무너지기 쉽습니다. 본 시스템은 단일 혹은 소수의 이벤트 루프 스레드만으로 수많은 커넥션을 처리하는 **Spring WebFlux** 구조를 채택하여 인프라 비용을 대폭 절감하고 대규모 연결을 유지합니다.
+등록, Heartbeat 갱신, 이탈, 만료 사용자 정리, 활성 전환은 Redis Lua Script로 처리합니다. 따라서 만료 사용자 목록을 읽은 뒤 별도 요청으로 삭제하던 이전 방식의 경쟁 조건을 피합니다.
 
-```
-[클라이언트 진입]
-       │
-       ▼  (POST /api/v1/queue/register)
-┌────────────────────────────────────────────────────────┐
-│ 1. 대기열 등록 및 순번 조회                               │
-│    - Redis Sorted Set (Key: queue:baseball:waiting)    │
-│    - Score: 진입 타임스탬프 (FIFO 보장)                   │
-└───────────────────────┬────────────────────────────────┘
-                        │
-                        ▼ (주기적 GET /api/v1/queue/rank 요청)
-┌────────────────────────────────────────────────────────┐
-│ 2. 대기 상태 유지 및 하트비트 갱신                         │
-│    - Redis ZSET (Key: queue:baseball:heartbeat)        │
-│    - Scheduler가 30초간 무응답 고스트 유저 자동 이탈 처리   │
-└───────────────────────┬────────────────────────────────┘
-                        │
-                        ▼ (3초마다 Scheduler에 의한 100명씩 popMin 연산)
-┌────────────────────────────────────────────────────────┐
-│ 3. 활성 상태 전환 (Active User)                         │
-│    - Redis String (Key: queue:baseball:active:{userId})│
-│    - 10분간 유효한 TTL 설정                              │
-└───────────────────────┬────────────────────────────────┘
-                        │
-                        ▼ (GET /api/v1/queue/active/token)
-┌────────────────────────────────────────────────────────┐
-│ 4. 검증 완료 및 JWT 진입 토큰 발급                         │
-│    - 티켓팅 본 서버 통과용 일회성 암호화 토큰 제공         │
-└────────────────────────────────────────────────────────┘
-```
+### Heartbeat 정책
 
-### 1. FIFO 대기열 관리 (`Redis Sorted Set`)
-*   사용자가 대기열에 진입하면 요청 시점의 Unix 타임스탬프를 `Score`로, 사용자 ID를 `Value`로 하여 `queue:baseball:waiting` ZSET에 저장합니다. 중복 진입 방지를 위해 기존 랭크 존재 여부를 먼저 Reactive하게 조회 후 적재합니다.
+- 기본 Heartbeat 유효 시간: 30초
+- 기본 정리 주기: 10초
+- 기본 정리 배치 크기: 500명
 
-### 2. 고스트 유저 감지 메커니즘 (`Heartbeat Pattern`)
-*   사용자가 대기 페이지에서 이탈(브라우저 종료, 탭 닫기 등)하여 무의미하게 대기열 자리를 차지하는 '고스트 유저' 문제를 해결하기 위해 **Heartbeat Scheduler**를 도입했습니다.
-*   사용자가 랭크 조회를 보낼 때마다 `queue:baseball:heartbeat`에 최신 타임스탬프를 갱신합니다.
-*   `HeartbeatScheduler`는 10초마다 구동되며 현재 시간 기준 30초 이전까지 하트비트가 없는 사용자를 찾아 대기열과 하트비트 내역에서 일괄 삭제(`ZREM`)하여 실질 대기열의 무결성을 유지합니다.
+기본 설정에서는 **30초 이상 Heartbeat가 갱신되지 않은 사용자**를 다음 정리 주기에 제거합니다. 스케줄 방식이므로 마지막 Heartbeat 이후 실제 제거 시점은 약 30~40초 범위가 될 수 있으며, 30초 이내 제거를 보장하지 않습니다.
 
-### 3. 처리량 스로틀링 (`Active Queue Transition`)
-*   `QueueScheduler`가 3초 주기(`fixedDelay = 3000`)로 가동되며, `ZPOPMIN` 연산을 통해 대기열 최상위 유저를 설정된 배치 사이즈(기본 100명)만큼 꺼내어 활성 유저 저장소(`queue:baseball:active:{userId}`)로 이동시키며 10분(`ACTIVE_TTL`)의 만료 시간을 부여합니다. 이를 통해 타깃 시스템이 감당 가능한 트래픽 속도를 완벽히 제어합니다.
+### 입장 처리 정책
 
----
+- 기본 입장 주기: 3초
+- 기본 입장 배치: 100명
+- active 상태 및 JWT 만료: 10분
 
-## 🔌 API 명세서 (API Specification)
+위 처리량은 단일 애플리케이션 인스턴스의 기본 설정입니다. 다중 인스턴스 환경에서 전체 시스템의 입장 처리량을 하나로 제한하려면 분산 스케줄 제어가 추가로 필요합니다.
 
-| HTTP Method | Endpoint | Description | Request Body / Param | Response Example |
-| :--- | :--- | :--- | :--- | :--- |
-| **POST** | `/api/v1/queue/register` | 대기열 최초 등록 및 상태 반환 | `{"userId": "user_10"}` | `{"userId":"user_10","rank":0,"estimatedWaitingCount":1}` |
-| **GET** | `/api/v1/queue/rank` | 현재 대기 순번 조회 및 하트비트 갱신 | `?userId=user_10` | `{"userId":"user_10","rank":23,"estimatedWaitingCount":145}` |
-| **GET** | `/api/v1/queue/active/token` | 활성 유저 확인 및 진입용 JWT 토큰 발급 | `?userId=user_10` | `{"token": "eyJhbGciOiJIUzI1NiJ9..."}` (미활성 시 403) |
-| **DELETE** | `/api/v1/queue/dropout` | 대기열 사용자 자진 이탈 처리 | `?userId=user_10` | `Void (HTTP 200 OK)` |
+## API
 
----
+| Method | Endpoint | 설명 |
+| --- | --- | --- |
+| POST | `/api/v1/queue/register` | 대기열 최초 등록. 최초 등록에만 `queueCredential`을 반환 |
+| GET | `/api/v1/queue/rank?userId={userId}` | 순번 조회와 Heartbeat 갱신 |
+| DELETE | `/api/v1/queue/dropout?userId={userId}` | waiting, heartbeat, credential 상태를 함께 제거 |
+| POST | `/api/v1/queue/active/token` | active 상태와 `queueCredential`을 검증해 JWT 발급 |
+| GET | `/api/v1/follow-up/access` | `ACTIVE_USER` JWT가 필요한 예시 보호 API |
 
-## ⚡ 부하 테스트 결과 분석 (k6 Load Test)
+### 등록
 
-시스템의 한계를 측정하고 안정성을 검증하기 위해 오픈소스 부하 테스트 도구인 `k6`를 활용하여 스트레스 테스트를 수행했습니다.
+```http
+POST /api/v1/queue/register
+Content-Type: application/json
 
-### 📊 테스트 시나리오 설정
-*   **가상 사용자 (VUs)**: 최대 300명의 VU가 동시 루핑 수행
-*   **테스트 기간**: 총 50초 지속 (3개의 램프업/다운 스테이지)
-*   **주요 검증 지표**: `p(95)` 응답 시간 200ms 이하 유지율, HTTP 에러율 1% 미만
-
-### 📈 k6 테스트 콘솔 출력 로그
-```text
-PS C:\Users\USER\development\baseball-ticketing-queue-system> k6 run load-test.js
-
-          /\      Grafana   /‾‾/
-     /\  /  \     |\  __   /  /
-    /  \/    \    | |/ /  /   ‾‾\
-   /          \   |   (  |  (‾)  |
-  / __________ \  |_|\_\  \_____/ 
-
-
-     execution: local
-        script: load-test.js
-        output: -
-
-     scenarios: (100.00%) 1 scenario, 300 max VUs, 1m20s max duration (incl. graceful stop):
-              * default: Up to 300 looping VUs for 50s over 3 stages (gracefulRampDown: 30s, gracefulStop: 30s)
-
-
-
-  █ THRESHOLDS
-
-    http_req_duration
-    ✓ 'p(95)<200' p(95)=11.54ms
-
-    http_req_failed
-    ✓ 'rate<0.01' rate=0.00%
-
-
-  █ TOTAL RESULTS
-
-    checks_total.......: 7238    140.212439/s
-    checks_succeeded...: 100.00% 7238 out of 7238
-    checks_failed......: 0.00%   0 out of 7238
-
-    ✓ Register Status is 200
-    ✓ Rank Check Status is 200
-
-    HTTP
-    http_req_duration..............: avg=7.36ms min=1.07ms med=6.02ms max=344.5ms p(90)=9.65ms p(95)=11.54ms
-      { expected_response:true }...: avg=7.36ms min=1.07ms med=6.02ms max=344.5ms p(90)=9.65ms p(95)=11.54ms
-    http_req_failed................: 0.00%  0 out of 7238
-    http_reqs......................: 7238   140.212439/s
-
-    EXECUTION
-    iteration_duration.............: avg=2.01s  min=2s      med=2.01s  max=2.36s    p(90)=2.01s   p(95)=2.02s
-    iterations.....................: 3619   70.10622/s
-    vus............................: 7      min=5         max=299
-    vus_max........................: 300    min=300       max=300
-
-    NETWORK
-    data_received..................: 966 kB 19 kB/s
-    data_sent......................: 982 kB 19 kB/s
-
-
-running (0m51.6s), 000/300 VUs, 3619 complete and 0 interrupted iterations
-default ✓ [======================================] 000/300 VUs  50s
+{"userId":"user_10"}
 ```
 
-### 🧐 테스트 결과 해석 및 시사점
-
-1.  **압도적인 응답 성능 (Low Latency)**
-    *   총 7,238건의 비동기 HTTP 요청을 소화하는 동안 **평균 응답 시간은 단 7.36ms**에 불과했습니다.
-    *   특히 상위 95%의 요청을 나타내는 **`p(95)` 수치가 11.54ms**로 측정되어 설정한 성능 임계치(200ms) 대비 17배 이상 빠른 매우 뛰어난 응답 일관성을 증명했습니다.
-2.  **결함률 0.00% (High Reliability)**
-    *   대기열 진입(`register`) 및 순위 조회(`rank`) 요청 전체에서 단 하나의 실패도 없이 **100% 성공률**을 기록했습니다. 
-    *   WebFlux 리액티브 스트림(`Mono`/`Flux`) 체인 내부에 블로킹 요소를 철저히 배제하고, Redis와의 통신 역시 non-blocking 커넥션을 활용했기 때문에 급격한 스레드 고갈 현상 없이 부하를 안정적으로 격리해 냈습니다.
-3.  **효율적인 처리 메커니즘**
-    *   Netty의 비동기 I/O 이벤트 루프 메커니즘 덕분에 최소한의 스레드 환경에서도 초당 140건(140.21 req/s) 이상의 대기열 랭킹 트래킹 연산이 병목 없이 가볍게 처리됨을 확인하였습니다.
-
----
-
-## 🚀 시작 가이드 (Quick Start)
-
-### Prerequisites
-*   Java 17 JDK 이상
-*   Docker Desktop (로컬 개발용 Redis 구동용)
-
-### 1. Repository Clone 및 빌드
-```bash
-git clone [https://github.com/CodeinHyuk/baseball-ticketing-queue-system.git](https://github.com/CodeinHyuk/baseball-ticketing-queue-system.git)
-cd baseball-ticketing-queue-system
-./gradlew clean build
+```json
+{
+  "userId": "user_10",
+  "rank": 0,
+  "estimatedWaitingCount": 1,
+  "queueCredential": "b4c7..."
+}
 ```
 
-### 2. 로컬 Redis 컨테이너 및 어플리케이션 실행
-```bash
-# Docker를 통한 Redis 독립 환경 실행
-docker run -d --name local-redis -p 6379:6379 redis:alpine
+`queueCredential`은 최초 등록 응답에서만 반환됩니다. 클라이언트는 이를 안전하게 보관해 active JWT 교환에 사용해야 합니다. 이 프로젝트는 별도 사용자 로그인 시스템을 포함하지 않으므로, 실제 서비스에서는 사용자 인증 주체와 대기열 사용자를 연결하는 인증 계층이 추가로 필요합니다.
 
-# Spring Boot 어플리케이션 실행
+### 활성 JWT 교환
+
+```http
+POST /api/v1/queue/active/token
+Content-Type: application/json
+
+{
+  "userId": "user_10",
+  "queueCredential": "b4c7..."
+}
+```
+
+active 상태가 아니거나 자격 값이 일치하지 않으면 `403 Forbidden`을 반환합니다.
+
+### 보호 API 호출
+
+```http
+GET /api/v1/follow-up/access
+Authorization: Bearer {active-jwt}
+```
+
+JWT에는 subject, `ACTIVE_USER` role, issuer, audience, issued-at, expiration이 포함됩니다. 보호 API는 active Redis Key를 다시 조회하지 않으므로, JWT가 발급된 뒤 active Key가 삭제되어도 유효 기간 내 토큰 자체는 검증 가능합니다.
+
+## 설정
+
+```yaml
+queue:
+  heartbeat:
+    timeout-ms: 30000
+    cleanup-interval-ms: 10000
+    cleanup-batch-size: 500
+  admission:
+    interval-ms: 3000
+    batch-size: 100
+    active-ttl-ms: 600000
+```
+
+JWT 비밀키는 저장소에 넣지 않습니다. 운영 또는 로컬 실행 시 256비트 이상 Base64 인코딩 키를 `JWT_SECRET` 환경 변수로 제공해야 합니다.
+
+```powershell
+$env:JWT_SECRET = '<Base64-encoded-32-byte-or-longer-secret>'
 ./gradlew bootRun
 ```
 
-### 3. 단위 및 통합 테스트 실행
+## 테스트
+
 ```bash
-# StepVerifier를 통한 비동기 리액티브 흐름 검증 테스트 포함
 ./gradlew test
 ```
 
----
+테스트는 다음을 검증합니다.
 
-## 🔒 핵심 비즈니스 룰 및 검증 (Definition of Done)
-1.  **Never Block**: 리액티브 체인 내부(`Service`, `Repository`, `Controller`)에서는 절대 `Thread.sleep()`이나 전통적인 동기식 Blocking API를 호출하지 않습니다.
-2.  **Reactive Architecture**: 모든 엔드포인트와 내부 컴포넌트는 비동기 리액티브 타입을 보장하기 위해 `Mono<T>` 또는 `Flux<T>`를 명확히 반환합니다.
-3.  **Idempotency & Session Protection**: 동일 유저의 중복 진입 요청에 대해 최초 시점의 랭크를 그대로 유지하며, 유효 만료 시간(Heartbeat 30초, Active Session 10분)을 정밀 제어하여 부정 진입 및 자원 낭비를 완벽 차단합니다.
+- 최초 등록 시 waiting, heartbeat, credential 상태 생성
+- 중복 등록 시 최초 waiting score 유지
+- 대기열에 없는 사용자의 Heartbeat 미생성
+- 이탈 시 waiting, heartbeat, credential 동시 삭제
+- 만료/비만료 사용자의 배치 정리
+- Heartbeat 갱신 직후 정리 시 정상 사용자 유지
+- active 전환 시 waiting과 heartbeat 제거
+- 유효, 누락, 변조, 만료, 권한 부족 JWT의 보호 API 동작
+- active Key 삭제 후에도 후속 보호 API가 Redis active 상태에 의존하지 않는지
+
+## 한계와 후속 작업
+
+- 사용자 로그인/신원 검증 도메인은 포함하지 않습니다. `queueCredential`은 대기열 자격을 위한 소유 증명이며 실제 사용자 인증을 대체하지 않습니다.
+- 다중 인스턴스 환경에서 전체 입장량을 단일 값으로 제한하려면 Redis 분산 락 또는 리더 선출이 필요합니다.
+- JWT 발급 후 즉시 강제 철회가 필요한 요구사항에는 별도 deny-list 또는 짧은 만료 시간 정책이 필요합니다.
+- 메모리 사용량, Redis Read 감소율, 예상 대기시간 오차, 평균 응답시간은 현재 재현 가능한 비교 측정 결과가 없으므로 수치로 주장하지 않습니다.

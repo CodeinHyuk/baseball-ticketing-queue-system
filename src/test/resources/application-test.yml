@@ -1,0 +1,9 @@
+spring:
+  data:
+    redis:
+      port: 6380
+
+security:
+  jwt:
+    # Test-only Base64 key. Production must provide JWT_SECRET externally.
+    secret: dGVzdC1qd3Qtc2lnbmluZy1rZXktZm9yLWxvY2FsLXRlc3RzLTAxMjM0NTY=

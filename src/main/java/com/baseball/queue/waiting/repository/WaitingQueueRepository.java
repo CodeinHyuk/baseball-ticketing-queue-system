@@ -1,12 +1,14 @@
 package com.baseball.queue.waiting.repository;
 
 import lombok.RequiredArgsConstructor;
+import com.baseball.queue.global.redis.QueueRedisKeys;
 import org.springframework.data.redis.core.ReactiveRedisTemplate;
-import org.springframework.data.redis.core.ZSetOperations;
+import org.springframework.data.redis.core.script.DefaultRedisScript;
 import org.springframework.stereotype.Repository;
 
-import reactor.core.publisher.Flux;
 import reactor.core.publisher.Mono;
+
+import java.util.List;
 
 @Repository
 @RequiredArgsConstructor
@@ -14,10 +16,58 @@ public class WaitingQueueRepository {
 
     private final ReactiveRedisTemplate<String, String> reactiveRedisTemplate;
 
-    // ZADD: 스코어(timestamp)와 함께 유저 등록
-    public Mono<Boolean> addToWaitingQueue(String queueKey, String userId, long timestamp) {
-        return reactiveRedisTemplate.opsForZSet().add(queueKey, userId, timestamp);
-    }
+    private static final DefaultRedisScript<Long> REGISTER_SCRIPT = new DefaultRedisScript<>("""
+            if redis.call('ZSCORE', KEYS[1], ARGV[1]) then
+                redis.call('ZADD', KEYS[2], ARGV[2], ARGV[1])
+                return 0
+            end
+            redis.call('ZADD', KEYS[1], ARGV[2], ARGV[1])
+            redis.call('ZADD', KEYS[2], ARGV[2], ARGV[1])
+            redis.call('SET', KEYS[3], ARGV[3])
+            return 1
+            """, Long.class);
+
+    private static final DefaultRedisScript<Long> REFRESH_HEARTBEAT_SCRIPT = new DefaultRedisScript<>("""
+            if not redis.call('ZSCORE', KEYS[1], ARGV[1]) then
+                return 0
+            end
+            redis.call('ZADD', KEYS[2], ARGV[2], ARGV[1])
+            return 1
+            """, Long.class);
+
+    private static final DefaultRedisScript<Long> REMOVE_USER_SCRIPT = new DefaultRedisScript<>("""
+            local removed = redis.call('ZREM', KEYS[1], ARGV[1])
+            redis.call('ZREM', KEYS[2], ARGV[1])
+            redis.call('DEL', KEYS[3])
+            return removed
+            """, Long.class);
+
+    private static final DefaultRedisScript<Long> REMOVE_EXPIRED_USERS_SCRIPT = new DefaultRedisScript<>("""
+            local users = redis.call('ZRANGEBYSCORE', KEYS[2], '-inf', ARGV[1], 'LIMIT', 0, ARGV[2])
+            local removed = 0
+            for _, userId in ipairs(users) do
+                redis.call('ZREM', KEYS[2], userId)
+                if redis.call('ZREM', KEYS[1], userId) == 1 then
+                    removed = removed + 1
+                end
+                redis.call('DEL', ARGV[3] .. userId)
+            end
+            return removed
+            """, Long.class);
+
+    private static final DefaultRedisScript<Long> PROMOTE_WAITING_USERS_SCRIPT = new DefaultRedisScript<>("""
+            local users = redis.call('ZRANGE', KEYS[1], 0, tonumber(ARGV[1]) - 1)
+            local promoted = 0
+            for _, userId in ipairs(users) do
+                if redis.call('ZREM', KEYS[1], userId) == 1 then
+                    redis.call('ZREM', KEYS[2], userId)
+                    redis.call('SET', ARGV[2] .. userId, 'true', 'PX', ARGV[4])
+                    redis.call('PEXPIRE', ARGV[3] .. userId, ARGV[4])
+                    promoted = promoted + 1
+                end
+            end
+            return promoted
+            """, Long.class);
 
     // ZRANK: 유저의 0-based 순번 조회
     public Mono<Long> getRank(String queueKey, String userId) {
@@ -29,41 +79,44 @@ public class WaitingQueueRepository {
         return reactiveRedisTemplate.opsForZSet().size(queueKey);
     }
 
-    // ZREM: 대기열에서 이탈 처리
-    public Mono<Long> removeFromWaitingQueue(String queueKey, String userId) {
-        return reactiveRedisTemplate.opsForZSet().remove(queueKey, userId);
+    public Mono<Boolean> registerWaitingUser(String userId, long timestamp, String queueCredential) {
+        return execute(REGISTER_SCRIPT,
+                List.of(QueueRedisKeys.WAITING_QUEUE, QueueRedisKeys.HEARTBEAT, QueueRedisKeys.queueCredentialKey(userId)),
+                List.of(userId, Long.toString(timestamp), queueCredential))
+                .map(created -> created == 1L);
     }
 
-    // pollMin: Redis의 ZPOPMIN을 사용하여 가장 우선순위가 높은 요소 n개(배치 사이즈)를 즉시 추출 (없으면 빈 Flux)
-    public Flux<ZSetOperations.TypedTuple<String>> popMin(String queueKey, long count) {
-        return reactiveRedisTemplate.opsForZSet().popMin(queueKey, count);
+    public Mono<Boolean> refreshHeartbeatIfWaiting(String userId, long timestamp) {
+        return execute(REFRESH_HEARTBEAT_SCRIPT,
+                List.of(QueueRedisKeys.WAITING_QUEUE, QueueRedisKeys.HEARTBEAT),
+                List.of(userId, Long.toString(timestamp)))
+                .map(updated -> updated == 1L);
     }
 
-    private static final String HEARTBEAT_KEY = "queue:baseball:heartbeat";
-
-    // 유저의 마지막 활동 시간 갱신
-    public Mono<Boolean> updateHeartbeat(String userId, long timestamp) {
-        return reactiveRedisTemplate.opsForZSet().add(HEARTBEAT_KEY, userId, timestamp);
+    public Mono<Long> removeWaitingUser(String userId) {
+        return execute(REMOVE_USER_SCRIPT,
+                List.of(QueueRedisKeys.WAITING_QUEUE, QueueRedisKeys.HEARTBEAT, QueueRedisKeys.queueCredentialKey(userId)),
+                List.of(userId));
     }
 
-    // 임계값 이전의 타임스탬프를 가진 만료된 유저 조회
-    public Flux<String> findExpiredUsers(long thresholdTimestamp) {
-        return reactiveRedisTemplate.opsForZSet()
-                .rangeByScore(HEARTBEAT_KEY,
-                        org.springframework.data.domain.Range.closed(0.0, (double) thresholdTimestamp));
+    public Mono<Long> removeExpiredWaitingUsers(long thresholdTimestamp, long batchSize) {
+        return execute(REMOVE_EXPIRED_USERS_SCRIPT,
+                List.of(QueueRedisKeys.WAITING_QUEUE, QueueRedisKeys.HEARTBEAT),
+                List.of(Long.toString(thresholdTimestamp), Long.toString(batchSize), QueueRedisKeys.queueCredentialPrefix()));
     }
 
-    // 만료된 유저들의 Heartbeat 데이터 일괄 삭제
-    public Mono<Long> removeExpiredHeartbeats(long thresholdTimestamp) {
-        return reactiveRedisTemplate.opsForZSet()
-                .removeRangeByScore(HEARTBEAT_KEY,
-                        org.springframework.data.domain.Range.closed(0.0, (double) thresholdTimestamp));
+    public Mono<Long> promoteWaitingUsers(long batchSize, long activeTtlMs) {
+        return execute(PROMOTE_WAITING_USERS_SCRIPT,
+                List.of(QueueRedisKeys.WAITING_QUEUE, QueueRedisKeys.HEARTBEAT),
+                List.of(
+                        Long.toString(batchSize),
+                        QueueRedisKeys.activeUserPrefix(),
+                        QueueRedisKeys.queueCredentialPrefix(),
+                        Long.toString(activeTtlMs)));
     }
 
-    // 대기열에서 다수의 유저 일괄 삭제
-    public Mono<Long> removeMultipleFromWaitingQueue(String queueKey, String... userIds) {
-        if (userIds.length == 0)
-            return Mono.just(0L);
-        return reactiveRedisTemplate.opsForZSet().remove(queueKey, (Object[]) userIds);
+    private Mono<Long> execute(DefaultRedisScript<Long> script, List<String> keys, List<String> arguments) {
+        return reactiveRedisTemplate.execute(script, keys, arguments)
+                .single(0L);
     }
 }

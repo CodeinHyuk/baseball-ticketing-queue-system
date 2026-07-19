@@ -11,7 +11,7 @@ public class ActiveQueueService {
 
     private final ActiveQueueRepository activeQueueRepository;
 
-    public Mono<Boolean> checkActiveStatus(String userId) {
-        return activeQueueRepository.isActiveUser(userId);
+    public Mono<Boolean> exchangeActiveCredential(String userId, String queueCredential) {
+        return activeQueueRepository.hasActiveCredential(userId, queueCredential);
     }
 }

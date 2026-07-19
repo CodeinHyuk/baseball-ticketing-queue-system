@@ -4,8 +4,8 @@ import { check, sleep } from 'k6';
 // 테스트 목표 및 임계값 설정
 export const options = {
     stages: [
-        { duration: '10s', target: 50 }, // 10초 동안 가상 유저를 100명까지 점진적 증가
-        { duration: '30s', target: 300 }, // 30초 동안 100명의 유저 유지 (최대 부하 구간)
+        { duration: '10s', target: 50 }, // 10초 동안 가상 유저를 50명까지 점진적 증가
+        { duration: '30s', target: 300 }, // 30초 동안 300명의 유저 유지 (최대 부하 구간)
         { duration: '10s', target: 0 },   // 10초 동안 유저를 0명으로 서서히 감소
     ],
     thresholds: {
